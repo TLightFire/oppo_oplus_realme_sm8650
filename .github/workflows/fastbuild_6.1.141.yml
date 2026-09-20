@@ -97,20 +97,30 @@ on:
         default: ''
 
       bbrv3_enable:
-        description: '是否应用 BBRv3 回移补丁(新增 bbr3 算法，与 bbr(v1) 并存；会改动 net/ipv4 公共路径，非必要不建议开启)'
+        description: '是否应用 BBRv3 回移补丁(新增 bbr3 算法)'
         required: true
         type: boolean
         default: 'true'
       powertune_enable:
-        description: '是否应用省电优化补丁批次(省电 wq + f2fs GC idle + 关 KFENCE/UBSAN/WQ看门狗 + fq 默认 + 减日志)'
+        description: '是否应用省电优化批次(省电 wq + f2fs GC idle + 关 KFENCE/UBSAN/WQ看门狗 + fq 默认)'
+        required: true
+        type: boolean
+        default: 'true'
+      extras_enable:
+        description: '是否应用 ferstar 第二批补丁(mm 小改 + 日志精简 + oom/f2fs 小改)'
         required: true
         type: boolean
         default: 'true'
       armv9_enable:
-        description: '是否以 -march=armv9-a 编译(SM8650 为 ARMv9 核；与省电批次独立，可单独开关)'
+        description: '是否 -march=armv9-a 编译'
         required: true
         type: boolean
         default: 'true'
+      o3_enable:
+        description: '是否 -O3 编译(ferstar 实际在用；内核官方只验证 -O2，不确定性较大)'
+        required: true
+        type: boolean
+        default: 'false'
 
 jobs:
   build:
@@ -662,11 +672,49 @@ jobs:
             echo "⚠️ 跳过配置校验(make 不可用)"
           fi
           echo "✅ 省电优化步骤完成"
-      - name: 启用 -march=armv9-a 编译标志
-        if: inputs.armv9_enable
+      - name: 应用 ferstar 第二批补丁（mm 小改 + 日志精简）
+        if: inputs.extras_enable
         run: |
-          echo "KCFLAGS+=-march=armv9-a" > /tmp/powertune_kcflags
-          echo "已写入编译标志文件: $(cat /tmp/powertune_kcflags)"
+          cd kernel_workspace/common
+          PATCH_DIR=/tmp/ferstar2
+          rm -rf "$PATCH_DIR"; mkdir -p "$PATCH_DIR"
+          # 来源：ferstar/realme_GT5pro-AndroidV-common-source (dev) 的对应 commit，按 SHA 固定：
+          #   648a829d71 pr_devel 精简（保留 no_printk 定义，仅去掉 #ifdef DEBUG 分支）
+          #   7f37a96259 trace_bprintk 清理（stm / n_tty / xhci-dbc / ext4 inline）
+          #   80af6cbe1a 启动日志：WARN 改单行 pr_err + pr_warn_once
+          #   e7a6116210 filemap 改用 xas_get_order / aa3e71ed85 filemap 去冗余 WARN
+          #   49255326b7 oom_kill 瘦身 / 528019b30d f2fs 去 page_index
+          SHAS="648a829d71 7f37a96259 80af6cbe1a e7a6116210 aa3e71ed85 49255326b7 528019b30d"
+          echo "=== 1/2 拉取补丁（$(echo $SHAS | wc -w) 个）==="
+          for sha in $SHAS; do
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
+              -o "$PATCH_DIR/$sha.patch" \
+              "https://github.com/ferstar/realme_GT5pro-AndroidV-common-source/commit/$sha.patch" \
+              || { echo "❌ 拉取 $sha 失败"; exit 1; }
+          done
+          echo "=== 2/2 依序应用 ==="
+          for sha in $SHAS; do
+            echo "--- $sha"
+            patch -p1 -N -F 3 < "$PATCH_DIR/$sha.patch"
+          done
+          if find . -name '*.rej' | grep -q .; then
+            echo "❌ 第二批补丁存在冲突，已中止构建:"
+            find . -name '*.rej'
+            exit 1
+          fi
+          echo "✅ 第二批补丁应用完成"
+      - name: 设置编译优化标志（armv9 / O3）
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.armv9_enable }}" = "true" ]; then FLAGS="$FLAGS KCFLAGS+=-march=armv9-a"; fi
+          if [ "${{ inputs.o3_enable }}" = "true" ]; then FLAGS="$FLAGS KCFLAGS+=-O3"; fi
+          if [ -n "$FLAGS" ]; then
+            echo "$FLAGS" | sed 's/^ *//' > /tmp/powertune_kcflags
+            echo "已写入编译标志: $(cat /tmp/powertune_kcflags)"
+          else
+            rm -f /tmp/powertune_kcflags
+            echo "未启用额外编译标志（保持内核默认 -O2）"
+          fi
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"
