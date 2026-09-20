@@ -96,6 +96,22 @@ on:
         type: string
         default: ''
 
+      bbrv3_enable:
+        description: '是否应用 BBRv3 回移补丁(新增 bbr3 算法，与 bbr(v1) 并存；会改动 net/ipv4 公共路径，非必要不建议开启)'
+        required: true
+        type: boolean
+        default: 'true'
+      powertune_enable:
+        description: '是否应用省电优化补丁批次(省电 wq + f2fs GC idle + 关 KFENCE/UBSAN/WQ看门狗 + fq 默认 + 减日志)'
+        required: true
+        type: boolean
+        default: 'true'
+      armv9_enable:
+        description: '是否以 -march=armv9-a 编译(SM8650 为 ARMv9 核；与省电批次独立，可单独开关)'
+        required: true
+        type: boolean
+        default: 'true'
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -553,6 +569,104 @@ jobs:
             done
           fi
            
+      - name: 应用 BBRv3 回移补丁
+        if: inputs.bbrv3_enable
+        run: |
+          cd kernel_workspace
+          echo "正在下载 BBRv3 回移补丁..."
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 180 \
+            -o /tmp/bbrv3.patch \
+            https://raw.githubusercontent.com/Numbersf/Action-Build/SukiSU-Ultra/patches/bbrv3/0001-net-tcp-backport-BBRv3-to-android14-6.1.patch
+          PATCH_SIZE=$(wc -c < /tmp/bbrv3.patch 2>/dev/null || echo 0)
+          echo "补丁大小: ${PATCH_SIZE} 字节"
+          if [ "${PATCH_SIZE}" -lt 50000 ]; then
+            echo "❌ BBRv3 补丁下载异常(仅 ${PATCH_SIZE} 字节)，已中止"
+            exit 1
+          fi
+          cd common
+          echo "正在应用 BBRv3 补丁..."
+          patch -p1 -N < /tmp/bbrv3.patch
+          if find . -name '*.rej' | grep -q .; then
+            echo "❌ BBRv3 补丁存在冲突，已中止构建:"
+            find . -name '*.rej'
+            exit 1
+          fi
+          echo "正在写入 BBRv3 内核配置..."
+          echo "CONFIG_TCP_CONG_ADVANCED=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_TCP_CONG_BBR3=y" >> arch/arm64/configs/gki_defconfig
+          echo "已追加: $(grep -c 'CONFIG_TCP_CONG_BBR3=y' arch/arm64/configs/gki_defconfig) 行 BBR3"
+          if make -s ARCH=arm64 O=/tmp/bbr3_cfgtest gki_defconfig >/dev/null 2>&1; then
+            if grep -q '^CONFIG_TCP_CONG_BBR3=y' /tmp/bbr3_cfgtest/.config; then
+              echo "✅ CONFIG_TCP_CONG_BBR3=y 已生效"
+            else
+              echo "❌ CONFIG_TCP_CONG_BBR3 未生效，已中止"
+              exit 1
+            fi
+          else
+            echo "⚠️ 跳过配置校验(make 不可用)"
+          fi
+      - name: 应用省电优化补丁（低风险批次）
+        if: inputs.powertune_enable
+        run: |
+          cd kernel_workspace/common
+          PATCH_DIR=/tmp/powertune
+          rm -rf "$PATCH_DIR"; mkdir -p "$PATCH_DIR"
+          # 来源：ferstar/realme_GT5pro-AndroidV-common-source (dev) 中对应的 commit，
+          # 原始出处为 freak07/Kirisakura_GKI_common 与 Kairui Song 的提交，按 SHA 固定不变。
+          SHAS="dced0adc81 e644e0b1d7 9c9ff846aa a9a5fc73f5 5fcd54f219 c4e5c66196 4a48d01f1f c84db4fdc0 3679f9b80f 528fe75b58 65ecd53a4e"
+          echo "=== 1/3 拉取补丁（$(echo $SHAS | wc -w) 个）==="
+          for sha in $SHAS; do
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 120 \
+              -o "$PATCH_DIR/$sha.patch" \
+              "https://github.com/ferstar/realme_GT5pro-AndroidV-common-source/commit/$sha.patch" \
+              || { echo "❌ 拉取 $sha 失败"; exit 1; }
+          done
+          echo "=== 2/3 依序应用 ==="
+          for sha in $SHAS; do
+            echo "--- $sha"
+            patch -p1 -N -F 3 < "$PATCH_DIR/$sha.patch"
+          done
+          if find . -name '*.rej' | grep -q .; then
+            echo "❌ 省电补丁存在冲突，已中止构建:"
+            find . -name '*.rej'
+            exit 1
+          fi
+          echo "=== 3/3 写入省电配置 ==="
+          CFG=arch/arm64/configs/gki_defconfig
+          sed -i -e '/^CONFIG_UBSAN=/d' -e '/^CONFIG_UBSAN_TRAP=/d' -e '/^CONFIG_UBSAN_LOCAL_BOUNDS=/d' \
+                 -e '/^# CONFIG_UBSAN_SHIFT is not set/d' -e '/^# CONFIG_UBSAN_BOOL is not set/d' \
+                 -e '/^# CONFIG_UBSAN_ENUM is not set/d' \
+                 -e '/^CONFIG_KFENCE=/d' -e '/^CONFIG_KFENCE_SAMPLE_INTERVAL=/d' \
+                 -e '/^CONFIG_KFENCE_NUM_OBJECTS=/d' -e '/^CONFIG_KFENCE_STATIC_KEYS=/d' \
+                 -e '/^CONFIG_WQ_WATCHDOG=/d' -e '/^CONFIG_RCU_LAZY_DEFAULT_OFF=/d' "$CFG"
+          {
+            echo "CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y"
+            echo "CONFIG_SUSPEND_SKIP_SYNC=y"
+            echo "CONFIG_NET_SCH_DEFAULT=y"
+            echo "CONFIG_DEFAULT_FQ=y"
+            echo 'CONFIG_DEFAULT_NET_SCH="fq"'
+            echo "# CONFIG_WQ_WATCHDOG is not set"
+            echo "# CONFIG_KFENCE is not set"
+            echo "# CONFIG_UBSAN is not set"
+            echo "# CONFIG_RCU_LAZY_DEFAULT_OFF is not set"
+          } >> "$CFG"
+          if make -s ARCH=arm64 O=/tmp/powertune_cfg gki_defconfig >/dev/null 2>&1; then
+            for kv in "CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y" "CONFIG_SUSPEND_SKIP_SYNC=y" \
+                      'CONFIG_DEFAULT_NET_SCH="fq"' "# CONFIG_WQ_WATCHDOG is not set" \
+                      "# CONFIG_KFENCE is not set" "# CONFIG_UBSAN is not set" \
+                      "# CONFIG_RCU_LAZY_DEFAULT_OFF is not set"; do
+              grep -qF "$kv" /tmp/powertune_cfg/.config || { echo "❌ 配置未生效: $kv"; exit 1; }
+            done
+            echo "✅ 省电配置全部生效"
+          else
+            echo "⚠️ 跳过配置校验(make 不可用)"
+          fi
+          echo "✅ 省电优化步骤完成"
+      - name: 启用 -march=armv9-a 编译标志
+        if: inputs.armv9_enable
+        run: |
+          echo "KCFLAGS+=-march=armv9-a" > /tmp/powertune_kcflags
+          echo "已写入编译标志文件: $(cat /tmp/powertune_kcflags)"
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"
@@ -624,8 +738,8 @@ jobs:
           sudo rm -rf /usr/local/lib/android &
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error $(cat /tmp/powertune_kcflags 2>/dev/null || true) gki_defconfig &&
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error $(cat /tmp/powertune_kcflags 2>/dev/null || true) Image
           
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
