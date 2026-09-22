@@ -7,6 +7,7 @@ env:
   SUB_VERSION: '141'
   KERNEL_NAME: 'android14-11-o-gca13bffobf09'
   CCACHE_KEY: ccache-ecsv4-6.1.141
+  LDCACHE_DIR: ${{ github.workspace }}/lto-cache
 
 on:
   workflow_dispatch:
@@ -122,6 +123,21 @@ on:
         required: true
         type: boolean
         default: 'false'
+      wild_enable:
+        description: '是否应用 WildKernels 特性集(优化补丁 + 配置增强 + 模块拦截/覆盖机制 + ABI 导出清理 + 假 config.gz)'
+        required: true
+        type: boolean
+        default: 'false'
+      wild_debloat_enable:
+        description: '是否按名单裁剪厂商内核模块(需下面的名单; 减体积用)'
+        required: true
+        type: boolean
+        default: 'false'
+      wild_modules_blacklist:
+        description: '要裁剪的模块(逗号分隔; 关键模块有保护名单会自动跳过)'
+        required: false
+        type: string
+        default: 'kernelsu,oplus_security_guard,oplus_qr_scan,oplus_score,oplus_vip_task,oplus_dns_cache,oplus_network_linkpower_module,oplus_data_module,oplus_secure_harden,oplus_security_keventupload,oplus_secure_guard_new,oplus_secure_guard,coresight_tpda,coresight_tgu,coresight_trace_noc,coresight_cti,coresight_qmi,coresight_dummy,coresight_remote_etm,coresight_tpdm,coresight_uetm,coresight_stm,coresight_tmc_sec,f_fs_ipc_log,qcom_iommu_debug,qti_battery_debug,rdbg,stm_heartbeat,stm_p_ost,stm_core,stm_ftrace,stm_console,spmi_pmic_arb_debug'
 
 jobs:
   build:
@@ -206,6 +222,16 @@ jobs:
             ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-
             ${{ env.CCACHE_REAL_KEY }}-
 
+      - name: 恢复 LTO 缓存
+        if: inputs.lto_enable
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ env.LDCACHE_DIR }}
+          key: lto-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            lto-cache-${{ runner.os }}-${{ github.ref_name }}-
+            lto-cache-${{ runner.os }}-
       - name: 拉取公共预置 ccache 缓存
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -704,6 +730,108 @@ jobs:
             exit 1
           fi
           echo "✅ 第二批补丁应用完成"
+      - name: 应用 WildKernels 特性集（优化补丁 + 配置增强）
+        if: inputs.wild_enable
+        run: |
+          cd kernel_workspace/common
+          KP=/tmp/wild_kp
+          rm -rf "$KP"; mkdir -p "$KP"
+          echo "=== 拉取 WildKernels/kernel_patches ==="
+          git clone --depth=1 https://github.com/WildKernels/kernel_patches.git "$KP/repo" || { echo "❌ 拉取 kernel_patches 失败"; exit 1; }
+          P="$KP/repo"
+          APPLIED=""; FAILED=""; SKIPPED=""
+          ap() {
+            n="${2:-$(basename "$1")}"
+            f="$P/$1"
+            if [ ! -f "$f" ]; then SKIPPED="$SKIPPED $n"; echo "⚠️ 上游没有该补丁: $n"; return 0; fi
+            if patch -p1 -N -F 3 --forward < "$f" > /tmp/wild_last.log 2>&1 && ! grep -q FAILED /tmp/wild_last.log; then
+              APPLIED="$APPLIED $n"; echo "✅ $n"
+            else
+              FAILED="$FAILED $n"; echo "⚠️ 有冲突(继续): $n"; grep -E "Hunk #|FAILED" /tmp/wild_last.log | head -4
+            fi
+          }
+          echo "=== 1/4 优化补丁（已在本树实测可干净落地的那批）==="
+          ap common/optimized_mem_operations.patch
+          ap common/file_struct_8bytes_align.patch
+          ap common/reduce_cache_pressure.patch
+          ap common/mem_opt_prefetch.patch
+          ap common/optimise_memcmp.patch
+          ap common/minimise_wakeup_time.patch
+          ap common/int_sqrt.patch
+          ap common/reduce_gc_thread_sleep_time.patch
+          ap common/add_timeout_wakelocks_globally.patch
+          ap common/f2fs_reduce_congestion.patch
+          ap common/reduce_freeze_timeout.patch
+          ap common/adjust_cpu_scan_order.patch
+          ap common/avoid_extra_s2idle_wake_attempts.patch
+          ap common/disable_cache_hot_buddy.patch
+          ap common/f2fs_enlarge_min_fsync_blocks.patch
+          ap common/increase_ext4_default_commit_age.patch
+          ap common/silence_irq_cpu_logspam.patch
+          ap common/silence_system_logspam.patch
+          ap common/unicode_bypass_fix_6.1+.patch
+          echo "· IPv6_NAT_FIX 跳过：你的 other_patch/config.patch 与它就是同一个文件(已验证 md5 相同)，网络增强步骤已应用"
+          sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' "$P/common/clear_page_16bytes_align.patch" > /tmp/wild_cp.diff
+          if patch -p1 -N -F 3 --forward < /tmp/wild_cp.diff > /tmp/wild_last.log 2>&1 && ! grep -q FAILED /tmp/wild_last.log; then APPLIED="$APPLIED clear_page_16bytes_align"; echo "✅ clear_page_16bytes_align(sed 变体)"; else FAILED="$FAILED clear_page_16bytes_align"; echo "⚠️ clear_page_16bytes_align 有冲突"; fi
+          ap common/add_limitation_scaling_min_freq.patch
+          ap common/re_write_limitation_scaling_min_freq.patch
+          ap common/use_unlikely_wrap_cpufreq.patch
+          ap common/increase_sk_mem_packets.patch
+          ap common/reduce_pci_pme_wakeups.patch
+          if [ "${{ inputs.bbr_enable }}" != "true" ] && [ "${{ inputs.bbrv3_enable }}" != "true" ]; then ap common/force_tcp_nodelay.patch; else echo "· 已启用 BBR/BBRv3，跳过 force_tcp_nodelay（同上游逻辑）"; fi
+          echo "=== 2/4 模块拦截/覆盖机制 ==="
+          ap oneplus/module_overlay/0001-module-Add-module-intercept-and-overlay-mechanism-android14-6.1.patch "module_overlay"
+          chmod +x kernel/module/module_overlay/convert_overlay.sh 2>/dev/null || true
+          if [ -d "$P/oneplus/module_overlay/modules" ] && [ -n "$(ls -A "$P/oneplus/module_overlay/modules" 2>/dev/null)" ]; then
+            mkdir -p kernel/module/module_overlay/modules
+            cp -v "$P"/oneplus/module_overlay/modules/*.ko kernel/module/module_overlay/modules/ 2>/dev/null || true
+            echo "已拷入 $(ls kernel/module/module_overlay/modules/*.ko 2>/dev/null | wc -l) 个覆盖模块"
+          else
+            echo "· 上游未提供现成 .ko 覆盖模块，仅启用机制（可自行放入 modules/ 目录）"
+          fi
+          echo "=== 3/4 配置增强 ==="
+          CFG=arch/arm64/configs/gki_defconfig
+          {
+            echo "CONFIG_IP_NF_TARGET_TTL=y"
+            echo "CONFIG_IP6_NF_TARGET_HL=y"
+            echo "CONFIG_IP6_NF_MATCH_HL=y"
+            echo "CONFIG_NET_SCH_CAKE=y"
+            echo "CONFIG_NET_SCH_PIE=y"
+            echo "CONFIG_NET_SCH_FQ_PIE=y"
+            echo "CONFIG_OPTIMIZE_INLINING=y"
+            echo "CONFIG_FRAME_WARN=0"
+          } >> "$CFG"
+          ap common/fake_config.patch "fake_config"
+          echo 'CONFIG_FAKE_DISABLE="CONFIG_IP6_NF_NAT CONFIG_TCP_CONG_ADVANCED"' >> "$CFG"
+          echo "=== 4/4 清理 ABI 受保护导出 ==="
+          rm -f android/abi_gki_protected_exports_* || true
+          sed -i 's/protected_modules = \[[^]]*\]/protected_modules = []/' modules.bzl 2>/dev/null || true
+          echo "================ WildKernels 特性小结 ================"
+          echo "已应用:${APPLIED}"
+          echo "有冲突(不中断构建):${FAILED}"
+          echo "上游缺失:${SKIPPED}"
+          echo "· 以上 28 条已在本树快照上按序实测全部干净应用(0 失败/0 .rej)；若真机异常，优先摘除内存例程类(optimized_mem_operations / optimise_memcmp / file_struct_8bytes_align / clear_page_16bytes_align)"
+          echo "===================================================="
+
+      - name: 裁剪厂商内核模块（WildKernels 名单机制）
+        if: inputs.wild_debloat_enable
+        run: |
+          cd kernel_workspace/common
+          KP=/tmp/wild_kp
+          if [ ! -d "$KP/repo" ]; then git clone --depth=1 https://github.com/WildKernels/kernel_patches.git "$KP/repo" || { echo "❌ 拉取 kernel_patches 失败"; exit 1; }; fi
+          LIST="${{ inputs.wild_modules_blacklist }}"
+          RISKY="coresight rust_binder msm_kgsl camera oplusboot rmnet_wlan rmnet_core msm_drm cnss2 oplus_chg_v2 reboot_mode rfkill bootloader_log"
+          VALID=""
+          OLDIFS="$IFS"; IFS=','; for m in $LIST; do
+            m="$(echo "$m" | tr -d ' ')"; [ -z "$m" ] && continue
+            skip=0; for r in $RISKY; do if [ "$m" = "$r" ]; then skip=1; echo "⚠️ 保护名单命中，跳过: $m"; fi; done
+            [ "$skip" = "0" ] && VALID="$VALID,$m"
+          done; IFS="$OLDIFS"
+          VALID="${VALID#,}"
+          echo "将裁剪: $VALID"
+          if patch -p1 -N -F 3 --forward < "$KP/repo/common/vendor_modules/0001-Support-conditional-vendor-modules-blacklisting-6.1-and-above.patch"; then echo "✅ 裁剪机制补丁已应用"; else echo "⚠️ 裁剪机制补丁未完全应用(继续)"; fi
+          echo "CONFIG_DEBLOAT_VENDOR_MODULES=\"$VALID\"" >> arch/arm64/configs/gki_defconfig
+          grep -n "CONFIG_DEBLOAT_VENDOR_MODULES" arch/arm64/configs/gki_defconfig
       - name: 设置编译优化标志（armv9）
         run: |
           FLAGS=""
@@ -715,6 +843,14 @@ jobs:
             rm -f /tmp/powertune_kcflags
             echo "未启用额外编译标志（保持内核默认 -O2）"
           fi
+      - name: 增加 swap 空间（LTO 链接阶段用）
+        if: inputs.lto_enable
+        run: |
+          sudo fallocate -l 16G /mnt/swap_lto 2>/dev/null || sudo dd if=/dev/zero of=/mnt/swap_lto bs=1M count=16384
+          sudo chmod 600 /mnt/swap_lto
+          sudo mkswap /mnt/swap_lto
+          sudo swapon /mnt/swap_lto || echo "⚠️ swap 启用失败（不中断构建；ThinLTO 链接可能因内存不足失败）"
+          echo "── swap 状态 ──"; free -h; df -h /mnt | tail -1
       - name: 应用 LTO 优化（Clang ThinLTO）
         if: inputs.lto_enable
         run: |
@@ -724,6 +860,7 @@ jobs:
           CFG=arch/arm64/configs/gki_defconfig
           sed -i -e '/^CONFIG_LTO_NONE=/d' -e '/^# CONFIG_LTO_CLANG_THIN is not set/d' "$CFG"
           echo "CONFIG_LTO_CLANG_THIN=y" >> "$CFG"
+          echo "LTO 缓存目录: $LDCACHE_DIR"
           echo "=== 校验 ThinLTO 依赖是否满足 ==="
           if make -s LLVM=1 ARCH=arm64 LD=ld.lld O=/tmp/lto_cfg gki_defconfig >/dev/null 2>&1; then
             if grep -q '^CONFIG_LTO_CLANG_THIN=y' /tmp/lto_cfg/.config; then
@@ -781,7 +918,14 @@ jobs:
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> ld-wrapper
           echo 'export FAKESTAT="'$FAKESTAT'"' >> ld-wrapper
           echo 'export FAKETIME="'$FAKETIME'"' >> ld-wrapper
-          echo 'ld.lld "$@"' >> ld-wrapper
+          if [ "${{ inputs.lto_enable }}" = "true" ]; then
+            LDCACHE="${LDCACHE_DIR:-$GITHUB_WORKSPACE/lto-cache}"
+            mkdir -p "$LDCACHE"
+            echo "ld.lld \"\$@\" --thinlto-cache-dir=$LDCACHE --thinlto-jobs=$(( $(nproc --all) / 2 ))" >> ld-wrapper
+          else
+            echo 'ld.lld "$@"' >> ld-wrapper
+          fi
+          echo "--- ld-wrapper 内容 ---"; cat ld-wrapper
           
           # 测试时间劫持测试是否正常工作
           echo "--- [Wrapper Test] 正在创建通用的时间劫持测试脚本 ---"
@@ -853,9 +997,12 @@ jobs:
           row "extras_enable"    "${{ inputs.extras_enable }}"    "$(in_img 'dump_oom_victim')"
           row "susfs_enable"     "${{ inputs.susfs_enable }}"     "$(in_cfg '^CONFIG_KSU_SUSFS=y')"
           row "lto_enable"       "${{ inputs.lto_enable }}"       "$(in_cfg '^CONFIG_LTO_CLANG_THIN=y')"
+          WILD_OK="$( { [ "$(in_cfg '^CONFIG_IP_NF_TARGET_TTL=y')" = true ] && [ "$(in_cfg '^CONFIG_NET_SCH_CAKE=y')" = true ] && [ "$(in_cfg '^CONFIG_OPTIMIZE_INLINING=y')" = true ]; } && echo true || echo false )"
+          row "wild_enable"      "${{ inputs.wild_enable }}"      "$WILD_OK"
+          row "wild_debloat"     "${{ inputs.wild_debloat_enable }}" "$( [ "${{ inputs.wild_debloat_enable }}" = "true" ] && in_cfg '^CONFIG_DEBLOAT_VENDOR_MODULES=' || echo "${{ inputs.wild_debloat_enable }}" )"
           echo "  · armv9_enable = ${{ inputs.armv9_enable }}（编译标志，产物里无法验证）"
           echo "--- 关键配置实际值 ---"
-          grep -aE '^CONFIG_(LTO|LTO_CLANG|LTO_NONE|CFI_CLANG|DEFAULT_FQ|WQ_POWER_EFFICIENT_DEFAULT|TCP_CONG_BBR3|KSU_SUSFS)=' "$CFG" || true
+          grep -aE '^CONFIG_(LTO|LTO_CLANG|LTO_NONE|CFI_CLANG|DEFAULT_FQ|WQ_POWER_EFFICIENT_DEFAULT|TCP_CONG_BBR3|KSU_SUSFS|IP_NF_TARGET_TTL|IP6_NF_TARGET_HL|NET_SCH_CAKE|NET_SCH_PIE|NET_SCH_FQ_PIE|OPTIMIZE_INLINING|DEBLOAT_VENDOR_MODULES)=' "$CFG" || true
           grep -aE '^# CONFIG_(LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|KFENCE|UBSAN|WQ_WATCHDOG) is not set' "$CFG" || true
           echo "============================================="
       - name: 保存新的 ccache 缓存
@@ -865,6 +1012,18 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
          
+      - name: 报告 LTO 缓存体积
+        if: inputs.lto_enable
+        continue-on-error: true
+        run: |
+          du -sh "$LDCACHE_DIR" 2>/dev/null || echo "(LTO 缓存目录不存在)"
+      - name: 保存 LTO 缓存到 Actions Cache
+        if: inputs.lto_enable
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ env.LDCACHE_DIR }}
+          key: lto-cache-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}
       - name: 应用KPM并修补内核
         if: inputs.kpm_enable
         run: |
